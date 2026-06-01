@@ -156,40 +156,33 @@ static void interpolate_offsets(float* off, const char* valid, int W) {
 }
 
 // ---------------------------------------------------------------------------
-// Solution 1 — uint8_t row-streaming, no full smooth buffer.
-// Guided filter + column accumulation are combined into a single row
-// pass, eliminating the 16 MB smooth buffer write+read.
+// Solution 1 — Destructive simplification: guided filter without the
+// second pair of box filters on a/b, no rf buffer, no clamping.
+// Saves 2 box filter calls per row vs the full guided filter.
 // ---------------------------------------------------------------------------
 static void destripe_1(const uint8_t* img, float* dst,
-                       int W, int H, int r, float eps, float max_off) {
+                       int W, int H, int r, float eps) {
     std::vector<float> off(W, 0.0f);
 
-    // Combined guided filter + column offset accumulation
-    // (one row pass instead of two)
     #pragma omp parallel
     {
-        std::vector<float> rf(W), r2(W), mu(W), cr(W), a(W), b(W), ma(W), mb(W);
+        std::vector<float> r2(W), mu(W), cr(W), a(W);
         std::vector<float> loc(W, 0.0f);
 
         #pragma omp for schedule(static)
         for (int y = 0; y < H; ++y) {
             const uint8_t* row = img + y * W;
-
-            for (int i = 0; i < W; ++i) { float v = row[i]; rf[i] = v; r2[i] = v * v; }
+            for (int i = 0; i < W; ++i) { float v = row[i]; r2[i] = v * v; }
             box_filter_row_u8(row, mu.data(), W, r);
             box_filter_row_f32(r2.data(), cr.data(), W, r);
             for (int i = 0; i < W; ++i) {
                 float v = cr[i] - mu[i] * mu[i];
                 a[i] = v / (v + eps);
-                b[i] = (1.0f - a[i]) * mu[i];
             }
-            box_filter_row_f32(a.data(), ma.data(), W, r);
-            box_filter_row_f32(b.data(), mb.data(), W, r);
-
-            // smooth output + accumulate column diffs in one row pass
             for (int i = 0; i < W; ++i) {
-                float s = ma[i] * rf[i] + mb[i];
-                loc[i] += rf[i] - s;
+                float v = (float)row[i];
+                float smooth = mu[i] + a[i] * (v - mu[i]);
+                loc[i] += v - smooth;
             }
         }
 
@@ -197,9 +190,8 @@ static void destripe_1(const uint8_t* img, float* dst,
         for (int x = 0; x < W; ++x) off[x] += loc[x];
     }
 
-    float iH = 1.0f/H;
-    for (int x = 0; x < W; ++x)
-        off[x] = std::max(-max_off, std::min(max_off, off[x]*iH));
+    float iH = 1.0f / H;
+    for (int x = 0; x < W; ++x) off[x] *= iH;
 
     #pragma omp parallel for schedule(static)
     for (int y = 0; y < H; ++y) {
@@ -368,7 +360,7 @@ int main() {
     std::cout << "Benchmark (avg " << N << ", " << W << "x" << H << ")\n\n";
 
     auto t0=std::chrono::high_resolution_clock::now();
-    for(int i=0;i<N;++i) destripe_1(img.data(),d1.data(),W,H,r,eps,mo);
+    for(int i=0;i<N;++i) destripe_1(img.data(),d1.data(),W,H,r,eps);
     auto t1=std::chrono::high_resolution_clock::now();
     double s1=std::chrono::duration<double,std::milli>(t1-t0).count()/N;
 
