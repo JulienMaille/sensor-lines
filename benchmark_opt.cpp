@@ -8,29 +8,40 @@
 #include <chrono>
 #include <omp.h>
 
-// ---------------------------------------------------------------------------
-// Box filter on uint8_t input → float output.
-// Accumulates in int32_t (fits 205 × 255 = 52275), only converts to float
-// at the final multiply — much faster than float accumulation.
+// Combined box filter: uint8→float mu (E[X]) and cr (E[X²]) in one pass.
+// Accumulates in int32_t (fits 205×255=52275 for sum, 205×65025≈13M for
+// sum-of-squares — still within int32_t range).
 // Uses 3-way loop split to eliminate min/max in the hot path.
-// ---------------------------------------------------------------------------
-static void box_filter_row_u8(const uint8_t* in, float* out, int W, int r) {
+static void box_filter_row_u8_mu_cr(const uint8_t* in, float* mu, float* cr, int W, int r) {
     const float s = 1.0f / (2 * r + 1);
     if (W <= 0) return;
-
-    int32_t sum = 0;
-    for (int i = -r; i <= r; ++i) sum += in[std::max(0, std::min(W - 1, i))];
-    out[0] = sum * s;
-
+    int32_t sx = 0, sx2 = 0;
+    for (int i = -r; i <= r; ++i) {
+        uint8_t v = in[std::max(0, std::min(W - 1, i))];
+        sx += v; sx2 += v * v;
+    }
+    mu[0] = sx * s; cr[0] = sx2 * s;
     int x = 1;
     int le = (r + 1 < W) ? (r + 1) : W;
-    for (; x < le; ++x) { sum += in[x + r] - in[0]; out[x] = sum * s; }
+    for (; x < le; ++x) {
+        uint8_t l = in[0], rv = in[x + r];
+        sx += rv - l; sx2 += rv*rv - l*l;
+        mu[x] = sx * s; cr[x] = sx2 * s;
+    }
     int me = (W - r > le) ? (W - r) : le;
-    for (; x < me; ++x) { sum += in[x + r] - in[x - r - 1]; out[x] = sum * s; }
-    for (; x < W; ++x)  { sum += in[W - 1] - in[x - r - 1]; out[x] = sum * s; }
+    for (; x < me; ++x) {
+        uint8_t l = in[x - r - 1], rv = in[x + r];
+        sx += rv - l; sx2 += rv*rv - l*l;
+        mu[x] = sx * s; cr[x] = sx2 * s;
+    }
+    for (; x < W; ++x) {
+        uint8_t l = in[x - r - 1], rv = in[W - 1];
+        sx += rv - l; sx2 += rv*rv - l*l;
+        mu[x] = sx * s; cr[x] = sx2 * s;
+    }
 }
 
-// float → float box filter (for a, b coefficients)
+// Float box filter for a/b coefficients in the full guided filter.
 static void box_filter_row_f32(const float* in, float* out, int W, int r) {
     const float s = 1.0f / (2 * r + 1);
     if (W <= 0) return;
@@ -43,97 +54,6 @@ static void box_filter_row_f32(const float* in, float* out, int W, int r) {
     int me = (W - r > le) ? (W - r) : le;
     for (; x < me; ++x) { sum += in[x + r] - in[x - r - 1]; out[x] = sum * s; }
     for (; x < W; ++x)  { sum += in[W - 1] - in[x - r - 1]; out[x] = sum * s; }
-}
-
-// ---------------------------------------------------------------------------
-// 5×5 separable Gaussian — uint8_t input, int32 accumulation in horizontal
-// pass, float temp for vertical pass.
-// ---------------------------------------------------------------------------
-static void gaussian_5x5_u8(const uint8_t* src, float* dst, int W, int H) {
-    std::vector<float> tmp(W * H);
-    const float inv16 = 1.0f / 16.0f;
-
-    // Horizontal — accumulate in int32, divide to float
-    #pragma omp parallel for schedule(static)
-    for (int y = 0; y < H; ++y) {
-        const uint8_t* r = src + y * W;
-        float* t = tmp.data() + y * W;
-        int x = 0;
-        // left border
-        for (; x < 2 && x < W; ++x) {
-            int xm2 = 0, xm1 = 0, xp1 = (x+1<W)?x+1:W-1, xp2 = (x+2<W)?x+2:W-1;
-            t[x] = (r[xm2] + 4*r[xm1] + 6*r[x] + 4*r[xp1] + r[xp2]) * inv16;
-        }
-        // main
-        for (; x < W-2; ++x)
-            t[x] = (r[x-2] + 4*r[x-1] + 6*r[x] + 4*r[x+1] + r[x+2]) * inv16;
-        // right border
-        for (; x < W; ++x) {
-            int xm2 = (x-2>=0)?x-2:0, xm1 = (x-1>=0)?x-1:0;
-            int xp1 = (x+1<W)?x+1:W-1, xp2 = (x+2<W)?x+2:W-1;
-            t[x] = (r[xm2] + 4*r[xm1] + 6*r[x] + 4*r[xp1] + r[xp2]) * inv16;
-        }
-    }
-
-    // Vertical — float on float
-    #pragma omp parallel for schedule(static)
-    for (int y = 0; y < H; ++y) {
-        const float* t = tmp.data();
-        float* d = dst + y * W;
-        if (y < 2 || y >= H-2) {
-            int ym2 = std::max(0, y-2), ym1 = std::max(0, y-1);
-            int yp1 = std::min(H-1, y+1), yp2 = std::min(H-1, y+2);
-            for (int i = 0; i < W; ++i)
-                d[i] = (t[ym2*W+i] + 4*t[ym1*W+i] + 6*t[y*W+i]
-                      + 4*t[yp1*W+i] + t[yp2*W+i]) * inv16;
-        } else {
-            const float* t0 = t + (y-2)*W, *t1 = t + (y-1)*W;
-            const float* t2 = t + y*W,     *t3 = t + (y+1)*W;
-            const float* t4 = t + (y+2)*W;
-            for (int i = 0; i < W; ++i)
-                d[i] = (t0[i] + 4*t1[i] + 6*t2[i] + 4*t3[i] + t4[i]) * inv16;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Flat mask — Sobel on Gaussian-blurred uint8_t
-// ---------------------------------------------------------------------------
-static void compute_flat_mask_u8(const uint8_t* img, char* mask,
-                                 int W, int H, float grad_thresh) {
-    std::vector<float> bl(W * H);
-    gaussian_5x5_u8(img, bl.data(), W, H);
-
-    if (H > 0) { std::fill(mask, mask + W, 0); std::fill(mask + (H-1)*W, mask + H*W, 0); }
-
-    float t2 = grad_thresh * grad_thresh * 16.0f;
-    #pragma omp parallel for schedule(static)
-    for (int y = 1; y < H-1; ++y) {
-        const float* r0 = bl.data() + (y-1)*W;
-        const float* r1 = bl.data() + y*W;
-        const float* r2 = bl.data() + (y+1)*W;
-        char* m = mask + y*W;
-        // left border
-        for (int x = 0; x < 2 && x < W; ++x) {
-            int xm1 = (x>0?x-1:0), xp1 = (x+1<W?x+1:W-1);
-            float gx = (r0[xp1]+2*r1[xp1]+r2[xp1]) - (r0[xm1]+2*r1[xm1]+r2[xm1]);
-            float gy = (r2[xm1]+2*r2[x]+r2[xp1]) - (r0[xm1]+2*r0[x]+r0[xp1]);
-            m[x] = (gx*gx+gy*gy < t2) ? 1 : 0;
-        }
-        // main
-        for (int x = 2; x < W-2; ++x) {
-            float gx = (r0[x+1]+2*r1[x+1]+r2[x+1]) - (r0[x-1]+2*r1[x-1]+r2[x-1]);
-            float gy = (r2[x-1]+2*r2[x]+r2[x+1]) - (r0[x-1]+2*r0[x]+r0[x+1]);
-            m[x] = (gx*gx+gy*gy < t2) ? 1 : 0;
-        }
-        // right border
-        for (int x = (W-2>2?W-2:2); x < W; ++x) {
-            int xm1 = x-1, xp1 = (x+1<W?x+1:W-1);
-            float gx = (r0[xp1]+2*r1[xp1]+r2[xp1]) - (r0[xm1]+2*r1[xm1]+r2[xm1]);
-            float gy = (r2[xm1]+2*r2[x]+r2[xp1]) - (r0[xm1]+2*r0[x]+r0[xp1]);
-            m[x] = (gx*gx+gy*gy < t2) ? 1 : 0;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -166,23 +86,20 @@ static void destripe_1(const uint8_t* img, float* dst,
 
     #pragma omp parallel
     {
-        std::vector<float> r2(W), mu(W), cr(W), a(W);
+        std::vector<float> mu(W), cr(W), a(W);
         std::vector<float> loc(W, 0.0f);
 
         #pragma omp for schedule(static)
         for (int y = 0; y < H; ++y) {
             const uint8_t* row = img + y * W;
-            for (int i = 0; i < W; ++i) { float v = row[i]; r2[i] = v * v; }
-            box_filter_row_u8(row, mu.data(), W, r);
-            box_filter_row_f32(r2.data(), cr.data(), W, r);
+            box_filter_row_u8_mu_cr(row, mu.data(), cr.data(), W, r);
             for (int i = 0; i < W; ++i) {
                 float v = cr[i] - mu[i] * mu[i];
                 a[i] = v / (v + eps);
             }
             for (int i = 0; i < W; ++i) {
                 float v = (float)row[i];
-                float smooth = mu[i] + a[i] * (v - mu[i]);
-                loc[i] += v - smooth;
+                loc[i] += (1.0f - a[i]) * (v - mu[i]);
             }
         }
 
@@ -202,57 +119,67 @@ static void destripe_1(const uint8_t* img, float* dst,
 }
 
 // ---------------------------------------------------------------------------
-// Solution 2 — uint8_t row-streaming, combined guided filter + accumulation
+// Solution 2 — Full guided filter + simple horizontal gradient mask.
 // ---------------------------------------------------------------------------
 static void destripe_2(const uint8_t* img, float* dst,
                        int W, int H, int r, float eps,
-                       float grad_thresh, int min_flat, float max_off) {
-    std::vector<char> mask(W*H);
-    compute_flat_mask_u8(img, mask.data(), W, H, grad_thresh);
-
+                       float grad_thresh, int min_flat) {
     std::vector<float> off(W, 0.0f);
     std::vector<int> cnt(W, 0);
     std::vector<char> valid(W, 0);
+    int ithresh = (int)grad_thresh;
 
     #pragma omp parallel
     {
-        std::vector<float> rf(W), r2(W), mu(W), cr(W), a(W), b(W), ma(W), mb(W);
+        std::vector<float> mu(W), cr(W), a(W), b(W), ma(W), mb(W);
         std::vector<float> lsum(W, 0.0f);
         std::vector<int> lcnt(W, 0);
 
         #pragma omp for schedule(static)
         for (int y = 0; y < H; ++y) {
             const uint8_t* row = img + y*W;
-            const char* mr = mask.data() + y*W;
-
-            for (int i = 0; i < W; ++i) { float v = row[i]; rf[i] = v; r2[i] = v*v; }
-            box_filter_row_u8(row, mu.data(), W, r);
-            box_filter_row_f32(r2.data(), cr.data(), W, r);
+            box_filter_row_u8_mu_cr(row, mu.data(), cr.data(), W, r);
             for (int i = 0; i < W; ++i) {
                 float v = cr[i] - mu[i]*mu[i];
                 a[i] = v / (v + eps);
-                b[i] = (1.0f - a[i]) * mu[i];
+                b[i] = mu[i] - a[i] * mu[i];
             }
             box_filter_row_f32(a.data(), ma.data(), W, r);
             box_filter_row_f32(b.data(), mb.data(), W, r);
 
-            for (int i = 0; i < W; ++i) {
-                float s = ma[i]*rf[i] + mb[i];
-                if (mr[i]) { lsum[i] += rf[i] - s; ++lcnt[i]; }
+            if (y > 0 && y < H - 1) {
+                int x = 0;
+                if (std::abs((int)row[0] - (int)row[1]) < ithresh) {
+                    float v = (float)row[0];
+                    lsum[0] += v - (ma[0] * v + mb[0]);
+                    ++lcnt[0];
+                }
+                for (x = 1; x < W - 1; ++x) {
+                    if (std::abs((int)row[x] - (int)row[x-1]) < ithresh
+                     && std::abs((int)row[x] - (int)row[x+1]) < ithresh) {
+                        float v = (float)row[x];
+                        lsum[x] += v - (ma[x] * v + mb[x]);
+                        ++lcnt[x];
+                    }
+                }
+                if (std::abs((int)row[W-1] - (int)row[W-2]) < ithresh) {
+                    float v = (float)row[W-1];
+                    lsum[W-1] += v - (ma[W-1] * v + mb[W-1]);
+                    ++lcnt[W-1];
+                }
             }
         }
 
         #pragma omp critical
         for (int x = 0; x < W; ++x) { off[x] += lsum[x]; cnt[x] += lcnt[x]; }
     }
+
     for (int x = 0; x < W; ++x) {
         if (cnt[x] >= min_flat) { off[x] /= cnt[x]; valid[x] = 1; }
         else off[x] = 0.0f;
     }
 
     interpolate_offsets(off.data(), valid.data(), W);
-    for (int x = 0; x < W; ++x)
-        off[x] = std::max(-max_off, std::min(max_off, off[x]));
 
     #pragma omp parallel for schedule(static)
     for (int y = 0; y < H; ++y) {
@@ -263,64 +190,74 @@ static void destripe_2(const uint8_t* img, float* dst,
 }
 
 // ---------------------------------------------------------------------------
-// Solution 3 — uint8_t row-streaming, combined weighted GF + accumulation
+// Solution 3 — Full weighted guided filter + simple horizontal gradient mask.
 // ---------------------------------------------------------------------------
 static void destripe_3(const uint8_t* img, float* dst,
                        int W, int H, int r, float eps, float eta,
-                       float grad_thresh, int min_flat, float max_off) {
-    std::vector<char> mask(W*H);
-    compute_flat_mask_u8(img, mask.data(), W, H, grad_thresh);
-
+                       float grad_thresh, int min_flat) {
     std::vector<float> off(W, 0.0f);
     std::vector<int> cnt(W, 0);
     std::vector<char> valid(W, 0);
+    int ithresh = (int)grad_thresh;
 
     #pragma omp parallel
     {
-        std::vector<float> rf(W), r2(W), mu(W), cr(W), a(W), b(W), ma(W), mb(W);
+        std::vector<float> mu(W), cr(W), a(W), b(W), ma(W), mb(W), var(W);
         std::vector<float> lsum(W, 0.0f);
         std::vector<int> lcnt(W, 0);
 
         #pragma omp for schedule(static)
         for (int y = 0; y < H; ++y) {
             const uint8_t* row = img + y*W;
-            const char* mr = mask.data() + y*W;
-
-            for (int i = 0; i < W; ++i) { float v = row[i]; rf[i] = v; r2[i] = v*v; }
-            box_filter_row_u8(row, mu.data(), W, r);
-            box_filter_row_f32(r2.data(), cr.data(), W, r);
+            box_filter_row_u8_mu_cr(row, mu.data(), cr.data(), W, r);
 
             float sv = 0;
             for (int i = 0; i < W; ++i) {
                 float v = cr[i] - mu[i]*mu[i];
-                r2[i] = v; sv += v;
+                var[i] = v; sv += v;
             }
             float mv = sv / W;
             for (int i = 0; i < W; ++i) {
-                float chi = (r2[i] + eta) / (mv + eta);
-                a[i] = r2[i] / (r2[i] + eps / chi);
-                b[i] = (1.0f - a[i]) * mu[i];
+                float chi = (var[i] + eta) / (mv + eta);
+                a[i] = var[i] / (var[i] + eps / chi);
+                b[i] = mu[i] - a[i] * mu[i];
             }
             box_filter_row_f32(a.data(), ma.data(), W, r);
             box_filter_row_f32(b.data(), mb.data(), W, r);
 
-            for (int i = 0; i < W; ++i) {
-                float s = ma[i]*rf[i] + mb[i];
-                if (mr[i]) { lsum[i] += rf[i] - s; ++lcnt[i]; }
+            if (y > 0 && y < H - 1) {
+                int x = 0;
+                if (std::abs((int)row[0] - (int)row[1]) < ithresh) {
+                    float v = (float)row[0];
+                    lsum[0] += v - (ma[0] * v + mb[0]);
+                    ++lcnt[0];
+                }
+                for (x = 1; x < W - 1; ++x) {
+                    if (std::abs((int)row[x] - (int)row[x-1]) < ithresh
+                     && std::abs((int)row[x] - (int)row[x+1]) < ithresh) {
+                        float v = (float)row[x];
+                        lsum[x] += v - (ma[x] * v + mb[x]);
+                        ++lcnt[x];
+                    }
+                }
+                if (std::abs((int)row[W-1] - (int)row[W-2]) < ithresh) {
+                    float v = (float)row[W-1];
+                    lsum[W-1] += v - (ma[W-1] * v + mb[W-1]);
+                    ++lcnt[W-1];
+                }
             }
         }
 
         #pragma omp critical
         for (int x = 0; x < W; ++x) { off[x] += lsum[x]; cnt[x] += lcnt[x]; }
     }
+
     for (int x = 0; x < W; ++x) {
         if (cnt[x] >= min_flat) { off[x] /= cnt[x]; valid[x] = 1; }
         else off[x] = 0.0f;
     }
 
     interpolate_offsets(off.data(), valid.data(), W);
-    for (int x = 0; x < W; ++x)
-        off[x] = std::max(-max_off, std::min(max_off, off[x]));
 
     #pragma omp parallel for schedule(static)
     for (int y = 0; y < H; ++y) {
@@ -365,12 +302,12 @@ int main() {
     double s1=std::chrono::duration<double,std::milli>(t1-t0).count()/N;
 
     t0=std::chrono::high_resolution_clock::now();
-    for(int i=0;i<N;++i) destripe_2(img.data(),d2.data(),W,H,r,eps,gt,mf,mo);
+    for(int i=0;i<N;++i) destripe_2(img.data(),d2.data(),W,H,r,eps,gt,mf);
     t1=std::chrono::high_resolution_clock::now();
     double s2=std::chrono::duration<double,std::milli>(t1-t0).count()/N;
 
     t0=std::chrono::high_resolution_clock::now();
-    for(int i=0;i<N;++i) destripe_3(img.data(),d3.data(),W,H,r,eps,eta,gt,mf,mo);
+    for(int i=0;i<N;++i) destripe_3(img.data(),d3.data(),W,H,r,eps,eta,gt,mf);
     t1=std::chrono::high_resolution_clock::now();
     double s3=std::chrono::duration<double,std::milli>(t1-t0).count()/N;
 
